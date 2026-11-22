@@ -1,14 +1,20 @@
 # images
-# *.jpg
-# *.jpeg
-# *.png
-# *.gif
-# *.bmp
-# *.PNG
-
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.PNG
+*.TIFF
+*.tiff
+*.JPG
+*.JPEG
 
 # object files
 *.o
+
+# output files
+*.out
 
 # test files and directories
 test/
