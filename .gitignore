@@ -1,6 +1,15 @@
 # images
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.bmp
+# *.jpg
+# *.jpeg
+# *.png
+# *.gif
+# *.bmp
+# *.PNG
+
+
+# object files
+*.o
+
+# test files and directories
+test/
+test_and_trash
