@@ -20,7 +20,7 @@ The headers the program includes:
 #include <errno.h>         /* errno, EEXIST                      */
 ```
 
-`_GNU_SOURCE` must be defined
+A note you'll be asked about at the defense: `_GNU_SOURCE` must be defined
 *before* any include, because it switches on the GNU extensions `strcasestr`
 and `strndup`. That's why the `Makefile` also passes `-D_GNU_SOURCE`.
 
@@ -366,7 +366,7 @@ the parent read the result and `waitpid` for the child.
 - **Syntax:** `int WIFEXITED(int wstatus);` and `int WEXITSTATUS(int wstatus);` (macros)
 - **Description:** `WIFEXITED` is true if the child ended normally (via `return`/`exit`). `WEXITSTATUS` then extracts the low 8 bits it exited with.
 - **Returns:** `WIFEXITED`: non-zero/zero. `WEXITSTATUS`: the exit code `0`–`255`.
-- **In spider.c:** `return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;` — success only if curl exited normally **and** with code 0.
+- **In spider.c:** `if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;` (else `return -1;`) in `http_download` — success only if curl exited normally **and** with code 0.
 - **Gotcha:** Only call `WEXITSTATUS` **after** `WIFEXITED` is true — otherwise the bits are meaningless (the child might have been killed by a signal, which `WIFSIGNALED` detects instead). The raw `status` is a packed bitfield, never a plain exit code.
 
 ---
@@ -405,7 +405,7 @@ the parent read the result and `waitpid` for the child.
 
 ## How it all fits (reading order)
 
-Natural order to understand the pieces:
+If you want to rebuild this yourself, the natural order to understand the pieces:
 
 1. **Arguments** — `getopt` reads `-r/-l/-p`, `atoi` parses the depth, `strncmp` validates the scheme.
 2. **One HTTP fetch** — `fork` + `pipe` + `dup2` + `execvp` run curl; the parent loops on `read` and grows a buffer with `realloc`/`memcpy`; `waitpid` + `WIFEXITED` check the result.
@@ -415,16 +415,4 @@ Natural order to understand the pieces:
 6. **Cleanup** — every `strdup`/`malloc` is matched by `free`; `make_dirs` used `mkdir`+`errno`; `perror`/`fprintf` report problems.
 
 Build it piece by piece in that order, testing each stage against a tiny local
-`python3 -m http.server`
-
-See instructions in next section
-
-## Test page
-
-To ilustrate the above section, you can find a small bash script and a set of 3 images in the test_page folder.
-Run the do_page.sh script. Open a new terminal and run the tests you want to perform.
-For example:
-./spider -r http://localhost:8000/          # default depth 5 → img_01.jpg, img_02.PNG, img_03.jpg
-./spider -r -l 1 http://localhost:8000/      # stop at depth 1 → img_01.jpg, img_02.PNG only
-./spider http://localhost:8000/               # only → img_01.jpg
-(Keep on mind the program renames the files to avoid rewritting)
+`python3 -m http.server`, and you'll have re-derived the whole spider.

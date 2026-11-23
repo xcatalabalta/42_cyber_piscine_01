@@ -43,9 +43,11 @@ the file itself.
 ## 2. `http_download` — fetch straight to a file
 
 ```c
-static int http_download(const char *url, const char *dest) {
+static int http_download(const char *url, const char *dest)
+{
     pid_t pid = fork();
-    if (pid < 0) return -1;                      /* fork failed */
+    if (pid < 0)                                 /* fork failed */
+        return -1;
     if (pid == 0) {                              /* ---- child ---- */
         char *argv[] = { "curl", "-fsSL", "-A", UA,
                          "--max-time", "20", "-o", (char *)dest,
@@ -54,8 +56,11 @@ static int http_download(const char *url, const char *dest) {
         _exit(127);                              /* only if exec failed */
     }
     int status;                                  /* ---- parent ---- */
-    if (waitpid(pid, &status, 0) < 0) return -1; /* wait for curl, reap it */
-    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+    if (waitpid(pid, &status, 0) < 0)            /* wait for curl, reap it */
+        return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        return 0;
+    return -1;
 }
 ```
 
@@ -104,11 +109,17 @@ is the **read** end. Bytes written to `fd[1]` come out of `fd[0]`.
 The code:
 
 ```c
-static char *http_get(const char *url) {
+static char *http_get(const char *url)
+{
     int fd[2];
-    if (pipe(fd) < 0) return NULL;               /* make the pipe */
+    if (pipe(fd) < 0)                            /* make the pipe */
+        return NULL;
     pid_t pid = fork();
-    if (pid < 0) { close(fd[0]); close(fd[1]); return NULL; }
+    if (pid < 0) {
+        close(fd[0]);
+        close(fd[1]);
+        return NULL;
+    }
 
     if (pid == 0) {                              /* ---- child ---- */
         close(fd[0]);                            /* won't read */
@@ -121,15 +132,26 @@ static char *http_get(const char *url) {
     }
 
     close(fd[1]);                                /* ---- parent: won't write ---- */
-    char *buf = NULL, tmp[4096];
-    size_t len = 0, cap = 0;
+    char *buf = NULL;
+    char tmp[4096];
+    size_t len = 0;
+    size_t cap = 0;
     ssize_t n;
     while ((n = read(fd[0], tmp, sizeof(tmp))) > 0) {   /* drain the pipe */
         if (len + (size_t)n + 1 > cap) {                /* grow buffer */
-            cap = cap ? cap * 2 : 8192;
-            while (cap < len + (size_t)n + 1) cap *= 2;
+            if (cap)
+                cap = cap * 2;
+            else
+                cap = 8192;
+            while (cap < len + (size_t)n + 1)
+                cap *= 2;
             char *p = realloc(buf, cap);
-            if (!p) { free(buf); close(fd[0]); waitpid(pid, NULL, 0); return NULL; }
+            if (!p) {
+                free(buf);
+                close(fd[0]);
+                waitpid(pid, NULL, 0);
+                return NULL;
+            }
             buf = p;
         }
         memcpy(buf + len, tmp, n);
@@ -137,9 +159,16 @@ static char *http_get(const char *url) {
     }
     close(fd[0]);
     int status;
-    if (waitpid(pid, &status, 0) < 0) { free(buf); return NULL; }
-    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) { free(buf); return NULL; }
-    if (!buf) return strdup("");                  /* empty but successful body */
+    if (waitpid(pid, &status, 0) < 0) {
+        free(buf);
+        return NULL;
+    }
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        free(buf);
+        return NULL;
+    }
+    if (!buf)
+        return strdup("");                        /* empty but successful body */
     buf[len] = '\0';
     return buf;
 }

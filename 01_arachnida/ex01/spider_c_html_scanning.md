@@ -53,20 +53,28 @@ A naive scan would mine those as if they were links. So **before** scanning, the
 spider deletes the *contents* of every `<script>` and `<style>` block:
 
 ```c
-static char *strip_blocks(const char *html) {
+static char *strip_blocks(const char *html)
+{
     char *out = malloc(strlen(html) + 1);
-    if (!out) return NULL;
+    if (!out)
+        return NULL;
     size_t o = 0;
     const char *p = html;
     while (*p) {
         if (!strncasecmp(p, "<script", 7)) {
             const char *e = strcasestr(p, "</script>");
-            p = e ? e + 9 : p + strlen(p);   /* jump past </script> (9 chars) */
+            if (e)                           /* jump past </script> (9 chars) */
+                p = e + 9;
+            else
+                p = p + strlen(p);
             continue;
         }
         if (!strncasecmp(p, "<style", 6)) {
             const char *e = strcasestr(p, "</style>");
-            p = e ? e + 8 : p + strlen(p);   /* jump past </style> (8 chars) */
+            if (e)                           /* jump past </style> (8 chars) */
+                p = e + 8;
+            else
+                p = p + strlen(p);
             continue;
         }
         out[o++] = *p++;                     /* otherwise copy the byte */
@@ -91,32 +99,47 @@ styles emptied out — so the scanner can't be fooled by code.
 
 ```c
 static void scan_attr(const char *html, const char *base, int depth,
-                      const char *attr, int is_srcset, int can_recurse) {
+                      const char *attr, int is_srcset, int can_recurse)
+{
     size_t alen = strlen(attr);
     const char *p = html;
     while ((p = strcasestr(p, attr)) != NULL) {   /* (a) next "src"/"href"... */
         const char *q = p + alen;
-        while (*q && isspace((unsigned char)*q)) q++;  /* (b) skip spaces */
-        if (*q != '=') { p += alen; continue; }        /* (c) must be '='  */
+        while (*q && isspace((unsigned char)*q))  /* (b) skip spaces */
+            q++;
+        if (*q != '=') {                          /* (c) must be '=' */
+            p += alen;
+            continue;
+        }
         q++;
-        char *val = read_attr_value(&q);               /* (d) read value   */
+        char *val = read_attr_value(&q);          /* (d) read value */
         if (is_srcset) {
             /* (e) split "a.jpg 1x, b.jpg 2x" -> first token of each part */
             char *comma;
-            for (char *tok = val; tok; tok = comma ? comma + 1 : NULL) {
+            char *tok = val;
+            while (tok) {
                 comma = strchr(tok, ',');
-                if (comma) *comma = '\0';
-                while (*tok && isspace((unsigned char)*tok)) tok++;
+                if (comma)
+                    *comma = '\0';
+                while (*tok && isspace((unsigned char)*tok))
+                    tok++;
                 char *sp = tok;
-                while (*sp && !isspace((unsigned char)*sp)) sp++;
+                while (*sp && !isspace((unsigned char)*sp))
+                    sp++;
                 *sp = '\0';
-                if (*tok) handle_ref(base, tok, depth, can_recurse);
+                if (*tok)
+                    handle_ref(base, tok, depth, can_recurse);
+                if (comma)
+                    tok = comma + 1;
+                else
+                    tok = NULL;
             }
-        } else if (*val) {
-            handle_ref(base, val, depth, can_recurse); /* (f) single value */
+        }
+        else if (*val) {
+            handle_ref(base, val, depth, can_recurse);  /* (f) single value */
         }
         free(val);
-        p = q;                                         /* (g) continue past it */
+        p = q;                                    /* (g) continue past it */
     }
 }
 ```
@@ -147,16 +170,28 @@ only job is to produce clean reference strings.
 ## 4. `read_attr_value` — read one quoted or unquoted value
 
 ```c
-static char *read_attr_value(const char **pp) {
+static char *read_attr_value(const char **pp)
+{
     const char *p = *pp;
-    while (*p && isspace((unsigned char)*p)) p++;   /* skip spaces after '=' */
+    while (*p && isspace((unsigned char)*p))         /* skip spaces after '=' */
+        p++;
     char quote = 0;
-    if (*p == '"' || *p == '\'') { quote = *p; p++; }  /* opening quote? */
+    if (*p == '"' || *p == '\'') {                   /* opening quote? */
+        quote = *p;
+        p++;
+    }
     const char *start = p;
-    if (quote) while (*p && *p != quote) p++;        /* quoted: until same quote */
-    else       while (*p && !isspace((unsigned char)*p) && *p != '>') p++; /* bare */
+    if (quote)
+        while (*p && *p != quote)                    /* quoted: until same quote */
+            p++;
+    else
+        while (*p && !isspace((unsigned char)*p) && *p != '>')  /* bare */
+            p++;
     char *val = strndup(start, p - start);           /* copy the value out */
-    *pp = (*p ? p + 1 : p);                           /* advance caller's cursor */
+    if (*p)                                          /* advance caller's cursor */
+        *pp = p + 1;
+    else
+        *pp = p;
     return val;
 }
 ```
@@ -243,8 +278,10 @@ Scanning never runs on untrusted bytes unguarded:
   stray `src`/`href` byte-sequences in binary data can't produce fake links.
 
   ```c
-  static int looks_html(const char *s) {
-      while (*s && isspace((unsigned char)*s)) s++;
+  static int looks_html(const char *s)
+  {
+      while (*s && isspace((unsigned char)*s))
+          s++;
       return *s == '<';
   }
   ```

@@ -58,7 +58,8 @@ The pieces the code cares about:
 ## 3. `resolve_url` — making a reference absolute
 
 ```c
-static char *resolve_url(const char *base, const char *ref) {
+static char *resolve_url(const char *base, const char *ref)
+{
     size_t rl = strcspn(ref, "#");       /* (0) drop the fragment */
     char *r = strndup(ref, rl);
     char *res = NULL;
@@ -91,7 +92,8 @@ if (!strncmp(r, "http://", 7) || !strncmp(r, "https://", 8)) {
 ### Case 2 — protocol-relative (`//host/...`)
 
 ```c
-} else if (!strncmp(r, "//", 2)) {
+}
+else if (!strncmp(r, "//", 2)) {
     size_t sl = strcspn(base, ":");      /* length of base's scheme */
     res = malloc(sl + strlen(r) + 2);
     sprintf(res, "%.*s:%s", (int)sl, base, r);   /* scheme + ":" + ref */
@@ -107,11 +109,16 @@ takes the scheme from `base` (everything up to the first `:`) and prepends it.
 ### Case 3 — root-relative (`/path`)
 
 ```c
-} else if (r[0] == '/') {
+}
+else if (r[0] == '/') {
     const char *p = strstr(base, "://");
     p += 3;                              /* skip past "://" */
     const char *slash = strchr(p, '/');  /* first '/' after the host */
-    size_t prefix = slash ? (size_t)(slash - base) : strlen(base);
+    size_t prefix;
+    if (slash)
+        prefix = (size_t)(slash - base);
+    else
+        prefix = strlen(base);
     res = malloc(prefix + strlen(r) + 1);
     sprintf(res, "%.*s%s", (int)prefix, base, r);  /* scheme://host + ref */
 }
@@ -130,19 +137,26 @@ The hardest case: the reference is relative to the **directory** of the current
 page.
 
 ```c
-} else {
+}
+else {
     const char *q = base + strcspn(base, "?#");   /* base without query/frag */
     const char *lastslash = NULL;
-    for (const char *p = base; p < q; p++) if (*p == '/') lastslash = p;
+    for (const char *p = base; p < q; p++)
+        if (*p == '/')
+            lastslash = p;
     const char *afterscheme = strstr(base, "://");
     if (afterscheme && lastslash && lastslash < afterscheme + 3)
         lastslash = NULL;                /* the only '/'s were in "://" */
     size_t prefix;
-    if (lastslash) prefix = lastslash - base + 1;  /* keep through last '/' */
-    else           prefix = q - base;              /* base has no path slash */
+    if (lastslash)
+        prefix = lastslash - base + 1;   /* keep through last '/' */
+    else
+        prefix = q - base;               /* base has no path slash */
     res = malloc(prefix + strlen(r) + 2);
-    if (lastslash) sprintf(res, "%.*s%s", (int)prefix, base, r);
-    else           sprintf(res, "%.*s/%s", (int)prefix, base, r);
+    if (lastslash)
+        sprintf(res, "%.*s%s", (int)prefix, base, r);
+    else
+        sprintf(res, "%.*s/%s", (int)prefix, base, r);
 }
 ```
 
@@ -170,7 +184,11 @@ char *afterhost = strstr(res, "://");
 if (afterhost && !strchr(afterhost + 3, '/')) {   /* no '/' after host */
     size_t rl2 = strlen(res);
     char *r2 = realloc(res, rl2 + 2);
-    if (r2) { res = r2; res[rl2] = '/'; res[rl2 + 1] = '\0'; }
+    if (r2) {
+        res = r2;
+        res[rl2] = '/';
+        res[rl2 + 1] = '\0';
+    }
 }
 ```
 
@@ -189,32 +207,47 @@ those are collapsed, dedup can't tell it from any other spelling of the same
 file.
 
 ```c
-static void normalize_in_place(char *url) {
+static void normalize_in_place(char *url)
+{
     char *p = strstr(url, "://");
-    if (!p) return;
+    if (!p)
+        return;
     p += 3;
     char *path = strchr(p, '/');         /* start of the path */
-    if (!path) return;                   /* host-only URL: nothing to do */
+    if (!path)                           /* host-only URL: nothing to do */
+        return;
 
     char qsave[2048] = "";               /* (1) save & detach the query */
     char *query = strpbrk(path, "?#");
-    if (query) { snprintf(qsave, sizeof(qsave), "%s", query); *query = '\0'; }
+    if (query) {
+        snprintf(qsave, sizeof(qsave), "%s", query);
+        *query = '\0';
+    }
 
     char *tmp = strdup(path);            /* (2) tokenize a COPY */
     char *segs[512];
     int n = 0;
     for (char *tok = strtok(tmp, "/"); tok; tok = strtok(NULL, "/")) {
-        if (n >= 512) break;
-        if (!strcmp(tok, "."))        continue;        /* drop "."       */
-        else if (!strcmp(tok, "..")) { if (n > 0) n--; }/* pop on ".."   */
-        else                          segs[n++] = tok;  /* keep normal seg*/
+        if (n >= 512)
+            break;
+        if (!strcmp(tok, "."))                   /* drop "." */
+            continue;
+        else if (!strcmp(tok, "..")) {           /* pop on ".." */
+            if (n > 0)
+                n--;
+        }
+        else                                     /* keep normal segment */
+            segs[n++] = tok;
     }
     char rebuilt[2048];                  /* (3) rejoin the survivors */
     size_t off = 0;
     rebuilt[0] = '\0';
     for (int i = 0; i < n && off < sizeof(rebuilt); i++)
         off += snprintf(rebuilt + off, sizeof(rebuilt) - off, "/%s", segs[i]);
-    if (n == 0) { rebuilt[0] = '/'; rebuilt[1] = '\0'; }
+    if (n == 0) {
+        rebuilt[0] = '/';
+        rebuilt[1] = '\0';
+    }
 
     strcpy(path, rebuilt);               /* (4) write back (only shrinks) */
     strcat(url, qsave);                  /*     reattach the query */
