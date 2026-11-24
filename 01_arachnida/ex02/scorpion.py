@@ -49,6 +49,17 @@ GPS_LON_REF = 3
 GPS_LON = 4
 
 
+def detect_format(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "JPEG"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "PNG"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF"
+    if data[:2] == b"BM":
+        return "BMP"
+    return "UNKNOWN"
+
 def human_size(size):
     """
     Format a byte count as a human-readable size.
@@ -259,6 +270,7 @@ def print_exif(img):
 
     if not exif and not exif_ifd and not gps_ifd:
         print("\n  EXIF: none present")
+        press_any_key("\n  Press Enter to continue...")
         return
 
     print("\n  EXIF metadata:")
@@ -351,13 +363,21 @@ def strip_metadata(src, dst):
     Returns:
         None (writes the cleaned image to dst)
     """
-    with Image.open(src) as img:
-        clean = Image.frombytes(img.mode, img.size, img.tobytes())
-        if img.mode == "P":                 # preserve indexed/GIF palette
-            palette = img.getpalette()
-            if palette:
-                clean.putpalette(palette)
-        clean.save(dst)
+    try:
+        with Image.open(src) as img:
+            clean = Image.frombytes(img.mode, img.size, img.tobytes())
+            if img.mode == "P":                 # preserve indexed/GIF palette
+                palette = img.getpalette()
+                if palette:
+                    clean.putpalette(palette)
+            clean.save(dst)
+    except Exception as e:
+        ext = detect_format(open(src, "rb").read())
+        newdst = os.path.splitext(dst)[0] + "." + ext.lower()
+        clean.save(newdst)
+        os.rename(newdst, dst)
+        pass
+
 
 
 def process(path, delete):
@@ -429,10 +449,13 @@ def gather_paths(args):
             found = False
             for name in names:
                 full = os.path.join(arg, name)
-                if os.path.isfile(full) and \
-                        os.path.splitext(name)[1].lower() in SUPPORTED:
-                    found = True
-                    add(full)
+                if os.path.isfile(full):
+                    try:
+                        with Image.open(full) as img:
+                            found = True
+                            add(full)
+                    except (UnidentifiedImageError, OSError):
+                        pass
             if not found:
                 print(f"  (no supported images in folder: {arg})")
         elif os.path.isfile(arg):
@@ -465,6 +488,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[scorpion] aborted.")
         sys.exit(130)
+    
+    print("\n[scorpion] done. Don't forget to delete .venv if you don't need it anymore.")
 
 
 if __name__ == "__main__":
