@@ -1,241 +1,214 @@
 #!/usr/bin/env python3
 """
-scorpion - display basic attributes and EXIF metadata of image files.
+scorpion (library edition) - basic attributes + EXIF/metadata of image files.
 
-Usage:
-    ./scorpion.py FILE1 [FILE2 ...]
+This is the "permissive" implementation: it uses Pillow to decode the image
+and read EXIF, rather than parsing the bytes by hand. The subject allows
+libraries that "handle files" as long as the program logic is your own; here
+the reporting logic (what to show, how to organise IFD0 / Exif / GPS) is ours,
+while the low-level byte decoding is delegated to Pillow.
 
-Handles .jpg/.jpeg, .png, .gif, .bmp. EXIF lives in JPEG; the other
-formats show basic attributes only. The EXIF/TIFF parsing is hand-written
-with struct (no Pillow/exifread) so the logic is our own.
+Covers the same extensions as spider (.jpg/.jpeg/.png/.gif/.bmp) and prints:
+  - basic attributes: format, mode, dimensions, size, timestamps (incl. creation
+    date where the platform exposes it);
+  - EXIF metadata for formats that carry it, including the Exif sub-IFD
+    (exposure, DateTimeOriginal, lens, ...) and the GPS IFD (coordinates),
+    which a naive getexif()-only approach misses;
+  - when GPS coordinates are present, the decimal lat/lon and (if the optional
+    reverse_geocoder + pycountry packages are installed) the nearest place and
+    country.
+
+Usage:    ./scorpion_lib.py FILE1 [FILE2 ...]
+Requires: Pillow                       (mandatory)
+Optional: reverse_geocoder, pycountry  (for the Location line; degrees still
+                                        print without them)
 """
 
 import os
 import sys
-import struct
+import signal
+import contextlib
 import datetime
+from PIL import Image, ExifTags, UnidentifiedImageError
 
-# ---- EXIF tag id -> human name (common subset; unknown shown as hex) --------
-TAGS = {
-    0x0100: "ImageWidth", 0x0101: "ImageLength", 0x010E: "ImageDescription",
-    0x010F: "Make", 0x0110: "Model", 0x0112: "Orientation",
-    0x011A: "XResolution", 0x011B: "YResolution", 0x0128: "ResolutionUnit",
-    0x0131: "Software", 0x0132: "DateTime", 0x013B: "Artist",
-    0x8298: "Copyright", 0x8769: "ExifOffset", 0x8825: "GPSInfo",
-    0x829A: "ExposureTime", 0x829D: "FNumber", 0x8822: "ExposureProgram",
-    0x8827: "ISOSpeedRatings", 0x9000: "ExifVersion",
-    0x9003: "DateTimeOriginal", 0x9004: "DateTimeDigitized",
-    0x920A: "FocalLength", 0xA002: "ExifImageWidth", 0xA003: "ExifImageHeight",
-    0xA430: "CameraOwnerName", 0xA431: "BodySerialNumber",
-}
-GPS_TAGS = {
-    0x0000: "GPSVersionID", 0x0001: "GPSLatitudeRef", 0x0002: "GPSLatitude",
-    0x0003: "GPSLongitudeRef", 0x0004: "GPSLongitude", 0x0005: "GPSAltitudeRef",
-    0x0006: "GPSAltitude",
-}
+# Reverse geocoding is OPTIONAL: if the packages are missing we still print the
+# decimal coordinates, just not the place name. This keeps the program runnable
+# on a machine that only has Pillow.
+try:
+    import reverse_geocoder as _rg
+    import pycountry as _pycountry
+    _GEOCODE = True
+except ImportError:
+    _GEOCODE = False
 
-# TIFF field type -> (size in bytes, struct code)
-TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8,
-             11: 4, 12: 8}
+# Same set spider handles.
+SUPPORTED = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
 
+# Reverse lookup tables shipped with Pillow: numeric tag id -> human name.
+TAG_NAMES = ExifTags.TAGS      # IFD0 + Exif tags
+GPS_NAMES = ExifTags.GPSTAGS   # GPS IFD tags
 
-def detect_format(data):
-    if data[:3] == b"\xff\xd8\xff":
-        return "JPEG"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "PNG"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "GIF"
-    if data[:2] == b"BM":
-        return "BMP"
-    return "UNKNOWN"
+# Pointer tags: their "value" is an offset to a sub-IFD, not data to print.
+EXIF_IFD_TAG = 0x8769
+GPS_IFD_TAG = 0x8825
+
+# Numeric tag ids inside the GPS IFD.
+GPS_LAT_REF = 1
+GPS_LAT = 2
+GPS_LON_REF = 3
+GPS_LON = 4
 
 
-def dimensions(fmt, data):
+def human_size(size):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
+
+
+def fmt_time(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def print_basic(path, img):
+    st = os.stat(path)
+    print("  Basic attributes:")
+    print(f"    Format        : {img.format}")
+    print(f"    Mode          : {img.mode}")
+    print(f"    Dimensions    : {img.width} x {img.height} px")
+    print(f"    File size     : {human_size(st.st_size)} ({st.st_size} bytes)")
+    print(f"    Modified      : {fmt_time(st.st_mtime)}")
+    print(f"    Inode changed : {fmt_time(st.st_ctime)}")
+    # True creation (birth) time only exists on some platforms/filesystems.
+    btime = getattr(st, "st_birthtime", None)
+    if btime:
+        print(f"    Created       : {fmt_time(btime)}")
+
+
+def print_ifd(title, items, names):
+    print(f"    [{title}]")
+    if not items:
+        print("      (empty)")
+        return
+    for tag_id, value in items.items():
+        name = names.get(tag_id, f"0x{tag_id:04X}")
+        # Trim long/binary blobs so the output stays readable.
+        text = value
+        if isinstance(value, bytes):
+            text = f"<{len(value)} bytes>"
+        print(f"      {str(name):<22}: {text!r}")
+
+
+def dms_to_decimal(dms, ref):
+    """(degrees, minutes, seconds) + 'N'/'S'/'E'/'W' -> signed decimal degrees."""
+    deg, minutes, sec = (float(x) for x in dms)
+    dec = deg + minutes / 60 + sec / 3600
+    if isinstance(ref, bytes):
+        ref = ref.decode(errors="ignore")
+    if ref and ref.upper() in ("S", "W"):
+        dec = -dec
+    return dec
+
+
+def gps_to_latlon(gps_ifd):
+    """Return (lat, lon) in decimal degrees, or None if GPS data is incomplete."""
     try:
-        if fmt == "PNG":
-            w, h = struct.unpack(">II", data[16:24])
-            return w, h
-        if fmt == "GIF":
-            w, h = struct.unpack("<HH", data[6:10])
-            return w, h
-        if fmt == "BMP":
-            w, h = struct.unpack("<ii", data[18:26])
-            return w, abs(h)
-        if fmt == "JPEG":
-            i = 2
-            while i + 9 < len(data):
-                if data[i] != 0xFF:
-                    i += 1
-                    continue
-                marker = data[i + 1]
-                # SOF markers carry the frame dimensions
-                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-                    h, w = struct.unpack(">HH", data[i + 5:i + 9])
-                    return w, h
-                if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-                    i += 2
-                    continue
-                seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
-                i += 2 + seg_len
-    except (struct.error, IndexError):
-        pass
-    return None
-
-
-# ---- EXIF ------------------------------------------------------------------
-def find_exif(data):
-    """Return the TIFF block (bytes starting at the byte-order mark) or None."""
-    i = 2
-    while i + 4 < len(data):
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        marker = data[i + 1]
-        if marker == 0xD9 or marker == 0xDA:   # EOI / start of scan -> stop
-            break
-        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
-            i += 2
-            continue
-        seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
-        if marker == 0xE1:                     # APP1
-            payload = data[i + 4:i + 2 + seg_len]
-            if payload[:6] == b"Exif\x00\x00":
-                return payload[6:]
-        i += 2 + seg_len
-    return None
-
-
-def read_value(tiff, endian, type_, count, value_field):
-    size = TYPE_SIZE.get(type_, 1) * count
-    if size <= 4:
-        raw = value_field[:size]
-    else:
-        off = struct.unpack(endian + "I", value_field)[0]
-        raw = tiff[off:off + size]
-
-    if type_ == 2:  # ASCII
-        return raw.split(b"\x00", 1)[0].decode("ascii", "replace")
-    codes = {1: "B", 3: "H", 4: "I", 6: "b", 8: "h", 9: "i"}
-    if type_ in codes:
-        vals = struct.unpack(endian + codes[type_] * count, raw)
-        return vals[0] if count == 1 else list(vals)
-    if type_ in (5, 10):  # (S)RATIONAL
-        code = "II" if type_ == 5 else "ii"
-        out = []
-        for k in range(count):
-            num, den = struct.unpack(endian + code, raw[k * 8:k * 8 + 8])
-            out.append(f"{num}/{den}")
-        return out[0] if count == 1 else out
-    if type_ == 7:  # UNDEFINED
-        return raw
-    return raw
-
-
-def parse_ifd(tiff, endian, offset, names):
-    """Return (list of (name, value), dict of sub-IFD pointers)."""
-    entries = []
-    subifds = {}
-    if offset + 2 > len(tiff):
-        return entries, subifds
-    (n,) = struct.unpack(endian + "H", tiff[offset:offset + 2])
-    p = offset + 2
-    for _ in range(n):
-        if p + 12 > len(tiff):
-            break
-        tag, type_, count = struct.unpack(endian + "HHI", tiff[p:p + 8])
-        value_field = tiff[p + 8:p + 12]
-        p += 12
-        if tag in (0x8769, 0x8825):            # pointers to sub-IFDs
-            subifds[tag] = struct.unpack(endian + "I", value_field)[0]
-            continue
-        try:
-            val = read_value(tiff, endian, type_, count, value_field)
-        except (struct.error, IndexError):
-            val = "<unreadable>"
-        name = names.get(tag, f"0x{tag:04X}")
-        entries.append((name, val))
-    return entries, subifds
-
-
-def parse_exif(tiff):
-    if tiff[:2] == b"II":
-        endian = "<"
-    elif tiff[:2] == b"MM":
-        endian = ">"
-    else:
+        lat = dms_to_decimal(gps_ifd[GPS_LAT], gps_ifd[GPS_LAT_REF])
+        lon = dms_to_decimal(gps_ifd[GPS_LON], gps_ifd[GPS_LON_REF])
+        return lat, lon
+    except (KeyError, TypeError, ValueError):
         return None
-    (ifd0_off,) = struct.unpack(endian + "I", tiff[4:8])
-    result = []
-    ifd0, subs = parse_ifd(tiff, endian, ifd0_off, TAGS)
-    result.append(("IFD0 (main image)", ifd0))
-    if 0x8769 in subs:
-        sub, _ = parse_ifd(tiff, endian, subs[0x8769], TAGS)
-        result.append(("Exif sub-IFD", sub))
-    if 0x8825 in subs:
-        gps, _ = parse_ifd(tiff, endian, subs[0x8825], GPS_TAGS)
-        result.append(("GPS IFD", gps))
-    return result
 
 
-# ---- reporting -------------------------------------------------------------
-def human_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n} bytes" if unit == "B" else f"{n/1024:.1f} {unit} ({n} bytes)"
-        n /= 1024
+def reverse_geocode(lat, lon):
+    """Nearest place + country for a coordinate, or None if geocoding is off."""
+    if not _GEOCODE:
+        return None
+    try:
+        # reverse_geocoder prints a "Loading..." banner to stdout on first use;
+        # redirect stdout to /dev/null just for that call so our report stays clean.
+        with open(os.devnull, "w") as devnull, \
+                contextlib.redirect_stdout(devnull):
+            hit = _rg.search((lat, lon), mode=1)[0]   # mode=1 = single-threaded
+        country = _pycountry.countries.get(alpha_2=hit["cc"])
+        place = ", ".join(p for p in (hit["name"], hit["admin1"]) if p)
+        name = country.name if country else hit["cc"]
+        return f"{place}, {name}" if place else name
+    except Exception:
+        return None
+
+
+def print_gps_location(gps_ifd):
+    """Print decimal coordinates and (if available) the resolved location."""
+    latlon = gps_to_latlon(gps_ifd)
+    if not latlon:
+        return
+    lat, lon = latlon
+    print(f"      {'Coordinates':<22}: {lat:.6f}, {lon:.6f}")
+    where = reverse_geocode(lat, lon)
+    if where:
+        print(f"      {'Location':<22}: {where}")
+
+
+
+def print_exif(img):
+    exif = img.getexif()           # top-level / IFD0 tags
+    # Pull the sub-IFDs explicitly; getexif() alone does NOT descend into them.
+    try:
+        exif_ifd = exif.get_ifd(EXIF_IFD_TAG)
+    except Exception:
+        exif_ifd = {}
+    try:
+        gps_ifd = exif.get_ifd(GPS_IFD_TAG)
+    except Exception:
+        gps_ifd = {}
+
+    if not exif and not exif_ifd and not gps_ifd:
+        print("\n  EXIF: none present")
+        return
+
+    print("\n  EXIF metadata:")
+    # IFD0 without the two pointer tags (shown as their own sections instead).
+    ifd0 = {k: v for k, v in exif.items()
+            if k not in (EXIF_IFD_TAG, GPS_IFD_TAG)}
+    print_ifd("IFD0 (main image)", ifd0, TAG_NAMES)
+    if exif_ifd:
+        print_ifd("Exif sub-IFD", exif_ifd, TAG_NAMES)
+    if gps_ifd:
+        print_ifd("GPS IFD", gps_ifd, GPS_NAMES)
+        print_gps_location(gps_ifd)
 
 
 def report(path):
     print("=" * 60)
     print(path)
     print("=" * 60)
-    try:
-        st = os.stat(path)
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        print(f"  cannot read: {e}\n")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in SUPPORTED:
+        print(f"  unsupported extension '{ext}' "
+              f"(expected {', '.join(SUPPORTED)})\n")
+        return
+    if not os.path.isfile(path):
+        print("  not a file / cannot read\n")
         return
 
-    fmt = detect_format(data)
-    print("  Basic attributes:")
-    print(f"    Format        : {fmt}")
-    print(f"    File size     : {human_size(st.st_size)}")
-    dim = dimensions(fmt, data)
-    if dim:
-        print(f"    Dimensions    : {dim[0]} x {dim[1]} px")
-    mtime = datetime.datetime.fromtimestamp(st.st_mtime)
-    ctime = datetime.datetime.fromtimestamp(st.st_ctime)
-    print(f"    Modified      : {mtime:%Y-%m-%d %H:%M:%S}")
-    print(f"    Inode changed : {ctime:%Y-%m-%d %H:%M:%S}")
-
-    if fmt == "JPEG":
-        tiff = find_exif(data)
-        if tiff is None:
-            print("\n  EXIF: none present")
-        else:
-            parsed = parse_exif(tiff)
-            if not parsed:
-                print("\n  EXIF: present but unreadable")
-            else:
-                print("\n  EXIF metadata:")
-                for section, entries in parsed:
-                    print(f"    [{section}]")
-                    if not entries:
-                        print("      (empty)")
-                    for name, val in entries:
-                        if isinstance(val, list):
-                            val = " ".join(str(x) for x in val)
-                        print(f"      {name:<20}: {val}")
-    else:
-        print("\n  EXIF: not applicable for this format")
+    try:
+        with Image.open(path) as img:
+            print_basic(path, img)
+            print_exif(img)
+    except (UnidentifiedImageError, OSError) as e:
+        print(f"  cannot read image: {e}")
     print()
 
 
 def main():
+    # Die quietly on a broken pipe (e.g. `scorpion_lib.py big.jpg | head`)
+    # instead of dumping a BrokenPipeError traceback.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if len(sys.argv) < 2:
-        print("Usage: scorpion.py FILE1 [FILE2 ...]", file=sys.stderr)
+        print("Usage: scorpion_lib.py FILE1 [FILE2 ...]", file=sys.stderr)
         sys.exit(1)
     for path in sys.argv[1:]:
         report(path)

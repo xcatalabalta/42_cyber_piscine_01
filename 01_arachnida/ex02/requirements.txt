@@ -1,0 +1,5 @@
+# Pin a range so a defense machine resolves a known-good Pillow.
+Pillow>=10,<13
+# Optional: enable the "Location" line (decimal coords print without them).
+reverse_geocoder
+pycountry
