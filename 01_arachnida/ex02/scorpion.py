@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
 """
-scorpion basic attributes + EXIF/metadata of image files.
+scorpion - basic attributes + EXIF/metadata of image files, with -d to delete.
 
-This implementation uses Pillow to decode the image and read EXIF.
-The low-level byte decoding is delegated to Pillow.
+Uses Pillow to decode the image and read EXIF. With -d, writes a
+metadata-free copy (universal rebuild from pixels) -- but only for images that
+actually carry metadata, so a clean file is never copied again.
+
+Arguments may be image files or folders (or a mix); relative paths are
+resolved to absolute and de-duplicated. A folder is scanned (non-recursive)
+for images by supported extension.
 
 Covers the same extensions as spider (.jpg/.jpeg/.png/.gif/.bmp) and prints:
-  - basic attributes: format, mode, dimensions, size, timestamps (incl. creation
-    date where the platform exposes it);
-  - EXIF metadata for formats that carry it, including the Exif sub-IFD
-    (exposure, DateTimeOriginal, lens, ...) and the GPS IFD (coordinates),
-    which a naive getexif()-only approach misses;
-  - when GPS coordinates are present, the decimal lat/lon and (if the optional
-    reverse_geocoder + pycountry packages are installed) the nearest place and
-    country.
+  - basic attributes: format, mode, dimensions, size, timestamps;
+  - EXIF metadata including the Exif sub-IFD and GPS IFD;
+  - decimal coordinates + nearest place (reverse_geocoder + pycountry) when a
+    valid GPS fix is present.
 
-Usage:    ./scorpion_lib.py FILE1 [FILE2 ...]
-Requires: Pillow                       (mandatory)
-Optional: reverse_geocoder, pycountry  (for the Location line; degrees still
-                                        print without them)
+Usage:
+    ./scorpion.py FILE_OR_DIR [FILE_OR_DIR ...]        # show metadata
+    ./scorpion.py -d FILE_OR_DIR [FILE_OR_DIR ...]     # show + strip each image
 """
 
 import os
 import sys
 import math
-import signal
+import argparse
 import contextlib
 import datetime
 from PIL import Image, ExifTags, UnidentifiedImageError
 import reverse_geocoder as _rg
 import pycountry as _pycountry
-
-# Reverse geocoding is OPTIONAL: 
-# Use the secure version in case of fail.
 
 # Same set spider handles.
 SUPPORTED = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
@@ -53,6 +50,13 @@ GPS_LON = 4
 
 
 def human_size(size):
+    """
+    Format a byte count as a human-readable size.
+    Arguments:
+        size: number of bytes (int)
+    Returns:
+        a string like "1.12 MB" (str)
+    """
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024:
             return f"{size:.2f} {unit}"
@@ -60,11 +64,40 @@ def human_size(size):
     return f"{size:.2f} PB"
 
 
+def press_any_key(prompt="  Press Enter to continue..."):
+    """
+    Pause until the user presses Enter.
+    Arguments:
+        prompt: message shown while waiting (str)
+    Returns:
+        None (returns immediately if stdin is closed/piped)
+    """
+    try:
+        input(prompt)
+    except EOFError:                        # piped/closed stdin -> don't block
+        pass
+
+
 def fmt_time(ts):
+    """
+    Format a POSIX timestamp as a local date-time string.
+    Arguments:
+        ts: seconds since the epoch (float)
+    Returns:
+        "YYYY-MM-DD HH:MM:SS" in local time (str)
+    """
     return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def print_basic(path, img):
+    """
+    Print the basic file/image attributes block.
+    Arguments:
+        path: path to the image file, used for stat() (str)
+        img: an open Pillow image, for format/mode/size (PIL.Image.Image)
+    Returns:
+        None (prints to stdout)
+    """
     st = os.stat(path)
     print("  Basic attributes:")
     print(f"    Format        : {img.format}")
@@ -73,23 +106,37 @@ def print_basic(path, img):
     print(f"    File size     : {human_size(st.st_size)} ({st.st_size} bytes)")
     print(f"    Modified      : {fmt_time(st.st_mtime)}")
     print(f"    Inode changed : {fmt_time(st.st_ctime)}")
-    # True creation (birth) time only exists on some platforms/filesystems.
     btime = getattr(st, "st_birthtime", None)
     if btime:
         print(f"    Created       : {fmt_time(btime)}")
 
 
 def clean_value(value):
-    """Make a tag value readable: shorten binary blobs, strip NUL padding."""
+    """
+    Make a tag value readable: shorten binary blobs, strip NUL padding.
+    Arguments:
+        value: a raw EXIF tag value (bytes, str, or other)
+    Returns:
+        "<N bytes>" for bytes, a NUL-stripped str for text, otherwise the
+        value unchanged
+    """
     if isinstance(value, bytes):
         return f"<{len(value)} bytes>"
     if isinstance(value, str):
-        # EXIF ASCII fields are often NUL-padded to a fixed width.
         return value.replace("\x00", "").strip()
     return value
 
 
 def print_ifd(title, items, names):
+    """
+    Print one IFD section as a table of tag -> value.
+    Arguments:
+        title: section heading, e.g. "GPS IFD" (str)
+        items: tag id -> value mapping for this IFD (dict)
+        names: tag id -> human-readable name lookup table (dict)
+    Returns:
+        None (prints to stdout)
+    """
     print(f"    [{title}]")
     if not items:
         print("      (empty)")
@@ -100,14 +147,27 @@ def print_ifd(title, items, names):
 
 
 def clean_ref(ref):
-    """Normalise a GPS ref to an upper-case letter, or '' if absent/padded."""
+    """
+    Normalise a GPS reference to an upper-case letter.
+    Arguments:
+        ref: the raw GPS*Ref value (bytes or str)
+    Returns:
+        "N"/"S"/"E"/"W", or "" if absent or NUL-padded (str)
+    """
     if isinstance(ref, bytes):
         ref = ref.decode(errors="ignore")
     return (ref or "").replace("\x00", "").strip().upper()
 
 
 def dms_to_decimal(dms, ref):
-    """(degrees, minutes, seconds) + 'N'/'S'/'E'/'W' -> signed decimal degrees."""
+    """
+    Convert a GPS coordinate from degrees/minutes/seconds to decimal degrees.
+    Arguments:
+        dms: the (degrees, minutes, seconds) triple (sequence of 3 numbers)
+        ref: hemisphere reference, "N"/"S"/"E"/"W" (str or bytes)
+    Returns:
+        the coordinate in decimal degrees, negative for S/W (float)
+    """
     deg, minutes, sec = (float(x) for x in dms)
     dec = deg + minutes / 60 + sec / 3600
     if clean_ref(ref) in ("S", "W"):
@@ -116,10 +176,15 @@ def dms_to_decimal(dms, ref):
 
 
 def gps_to_latlon(gps_ifd):
-    """Return (lat, lon) in decimal degrees, or None if GPS is absent/invalid.
+    """
+    Extract (lat, lon) in decimal degrees from a GPS IFD.
 
     Phones often write a GPS IFD with no actual fix: empty refs and 0/0
-    rationals that decode to NaN. Those must be rejected, not printed.
+    rationals that decode to NaN. Those are rejected, not returned.
+    Arguments:
+        gps_ifd: the GPS IFD, a tag id -> value mapping (dict)
+    Returns:
+        (lat, lon) as floats, or None if GPS is absent/invalid (tuple | None)
     """
     rlat = clean_ref(gps_ifd.get(GPS_LAT_REF))
     rlon = clean_ref(gps_ifd.get(GPS_LON_REF))
@@ -136,11 +201,15 @@ def gps_to_latlon(gps_ifd):
 
 
 def reverse_geocode(lat, lon):
-    """Nearest place + country for a coordinate, or None if geocoding is off."""
-
+    """
+    Resolve the nearest place and country for a coordinate.
+    Arguments:
+        lat: latitude in decimal degrees (float)
+        lon: longitude in decimal degrees (float)
+    Returns:
+        "City, Region, Country" (str), or None on any lookup failure
+    """
     try:
-        # reverse_geocoder prints a "Loading..." banner to stdout on first use;
-        # redirect stdout to /dev/null just for that call so our report stays clean.
         with open(os.devnull, "w") as devnull, \
                 contextlib.redirect_stdout(devnull):
             hit = _rg.search((lat, lon), mode=1)[0]   # mode=1 = single-threaded
@@ -153,7 +222,13 @@ def reverse_geocode(lat, lon):
 
 
 def print_gps_location(gps_ifd):
-    """Print decimal coordinates and (if available) the resolved location."""
+    """
+    Print decimal coordinates and, if resolvable, the location.
+    Arguments:
+        gps_ifd: the GPS IFD, a tag id -> value mapping (dict)
+    Returns:
+        None (prints nothing when there is no valid GPS fix)
+    """
     latlon = gps_to_latlon(gps_ifd)
     if not latlon:
         return
@@ -165,8 +240,14 @@ def print_gps_location(gps_ifd):
 
 
 def print_exif(img):
+    """
+    Print the EXIF report: IFD0, the Exif sub-IFD and the GPS IFD.
+    Arguments:
+        img: an open Pillow image (PIL.Image.Image)
+    Returns:
+        None (prints to stdout; prints "EXIF: none present" if there is none)
+    """
     exif = img.getexif()           # top-level / IFD0 tags
-    # Pull the sub-IFDs explicitly; getexif() alone does NOT descend into them.
     try:
         exif_ifd = exif.get_ifd(EXIF_IFD_TAG)
     except Exception:
@@ -181,7 +262,6 @@ def print_exif(img):
         return
 
     print("\n  EXIF metadata:")
-    # IFD0 without the two pointer tags (shown as their own sections instead).
     ifd0 = {k: v for k, v in exif.items()
             if k not in (EXIF_IFD_TAG, GPS_IFD_TAG)}
     print_ifd("IFD0 (main image)", ifd0, TAG_NAMES)
@@ -190,41 +270,201 @@ def print_exif(img):
     if gps_ifd:
         print_ifd("GPS IFD", gps_ifd, GPS_NAMES)
         print_gps_location(gps_ifd)
+        
+    press_any_key("\n  Press Enter to continue...")
+
+
+def has_metadata(img):
+    """
+    Report whether an image carries descriptive metadata worth stripping.
+
+    Checks the fields our strip removes (EXIF incl. Exif/GPS sub-IFDs, XMP,
+    comment, ICC profile, PNG text chunks). Deliberately ignores the jfif/dpi
+    markers Pillow re-adds on save, so a freshly-stripped file reads as clean
+    (this is what prevents <name>_clean_clean accumulation).
+    Arguments:
+        img: an open Pillow image (PIL.Image.Image)
+    Returns:
+        True if descriptive metadata is present, else False (bool)
+    """
+    if len(img.getexif()) > 0:
+        return True
+    info = img.info
+    if info.get("xmp") or info.get("comment") or info.get("icc_profile"):
+        return True
+    if getattr(img, "text", None):             # PNG tEXt/iTXt/zTXt
+        return True
+    return False
 
 
 def report(path):
+    """
+    Show the full metadata report for one file.
+    Arguments:
+        path: path to the image file (str)
+    Returns:
+        True if the file was a readable image, False otherwise (bool)
+    """
     print("=" * 60)
     print(path)
     print("=" * 60)
-
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in SUPPORTED:
-        print(f"  unsupported extension '{ext}' "
-              f"(expected {', '.join(SUPPORTED)})\n")
-        return
-    if not os.path.isfile(path):
-        print("  not a file / cannot read\n")
-        return
-    """
     try:
         with Image.open(path) as img:
             print_basic(path, img)
             print_exif(img)
     except (UnidentifiedImageError, OSError) as e:
-        print(f"  cannot read image: {e}")
+        print(f"\033[91m  cannot read image: {e}\033[0m")
+        press_any_key("\n  Press Enter to continue...")
+        print()
+        return False
     print()
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  -d : metadata deletion
+# --------------------------------------------------------------------------- #
+
+def cleaned_path(path):
+    """
+    Build the output path for a cleaned copy (photo.jpg -> photo_clean.jpg).
+    Arguments:
+        path: the original file path (str)
+    Returns:
+        the "<stem>_clean<ext>" path, next to the original (str)
+    """
+    stem, ext = os.path.splitext(path)
+    return f"{stem}_clean{ext}"
+
+
+def strip_metadata(src, dst):
+    """
+    Universal strip: rebuild the image from its raw pixel bytes only, so NO
+    metadata (EXIF, GPS, XMP, text chunks, ...) can survive. For JPEG this
+    re-encodes the pixels (a small quality loss) -- the trade-off for a
+    format-independent, guaranteed-clean result. tobytes()/frombytes() is the
+    stable, non-deprecated pixel API; getdata()/putdata() is deprecated in
+    Pillow 12.
+    Arguments:
+        src: path to the source image (str)
+        dst: path to write the metadata-free copy (str)
+    Returns:
+        None (writes the cleaned image to dst)
+    """
+    with Image.open(src) as img:
+        clean = Image.frombytes(img.mode, img.size, img.tobytes())
+        if img.mode == "P":                 # preserve indexed/GIF palette
+            palette = img.getpalette()
+            if palette:
+                clean.putpalette(palette)
+        clean.save(dst)
+
+
+def process(path, delete):
+    """
+    Show metadata; with -d, strip to a clean copy only if metadata is present.
+    Arguments:
+        path: path to the image file (str)
+        delete: if True, write <name>_clean.ext when the image has metadata,
+                show it, then pause (bool)
+    Returns:
+        None
+    """
+    ok = report(path)
+    if not delete or not ok:
+        return
+
+    # Only clean images that actually carry metadata. This also means a
+    # already-clean file is never copied again (no _clean_clean accumulation).
+    try:
+        with Image.open(path) as img:
+            present = has_metadata(img)
+    except (UnidentifiedImageError, OSError):
+        return
+    if not present:
+        print("  no metadata to remove; nothing to clean.\n")
+        return
+
+    dst = cleaned_path(path)
+    try:
+        strip_metadata(path, dst)
+    except (UnidentifiedImageError, OSError) as e:
+        print(f"  cannot clean image: {e}\n")
+        return
+    print(f"  --> metadata stripped; clean copy written to:\n      {dst}\n")
+    report(dst)
+    press_any_key()
+
+
+def gather_paths(args):
+    """
+    Flatten file/folder arguments into a de-duplicated list of image paths.
+
+    Files are taken as given (Image.open validates them); folders are scanned
+    non-recursively for images by supported extension. Paths are made absolute,
+    which resolves relative paths and lets duplicates (e.g. a folder and a file
+    inside it) collapse to one entry. Unreadable/missing arguments are skipped
+    with a message.
+    Arguments:
+        args: the raw path arguments from the command line (list[str])
+    Returns:
+        a de-duplicated list of absolute image paths, in argument/scan order
+        (list[str])
+    """
+    paths, seen = [], set()
+
+    def add(p):
+        ap = os.path.abspath(p)
+        if ap not in seen:
+            seen.add(ap)
+            paths.append(ap)
+
+    for arg in args:
+        if os.path.isdir(arg):
+            try:
+                names = sorted(os.listdir(arg))
+            except OSError as e:
+                print(f"  skipping folder (cannot read): {arg} ({e})")
+                continue
+            found = False
+            for name in names:
+                full = os.path.join(arg, name)
+                if os.path.isfile(full) and \
+                        os.path.splitext(name)[1].lower() in SUPPORTED:
+                    found = True
+                    add(full)
+            if not found:
+                print(f"  (no supported images in folder: {arg})")
+        elif os.path.isfile(arg):
+            add(arg)
+        else:
+            print(f"  skipping (not found): {arg}")
+    return paths
 
 
 def main():
-    # Use the secure version in case of fail.
-    
-    if len(sys.argv) < 2:
-        print("Usage: scorpion_lib.py FILE1 [FILE2 ...]", file=sys.stderr)
-        sys.exit(1)
-    for path in sys.argv[1:]:
-        report(path)
-    print("[scorpion] done.\nDon't forget to delete the .venv folder if you don't need it anymore.")
+    """
+    Parse the command line and process each gathered image path.
+    Arguments:
+        none (reads sys.argv)
+    Returns:
+        None (exits non-zero on a usage error or on Ctrl-C)
+    """
+    parser = argparse.ArgumentParser(
+        description="Display image metadata; optionally strip it with -d.")
+    parser.add_argument("files", nargs="+", metavar="FILE_OR_DIR",
+                        help="image file(s) or folder(s) to inspect")
+    parser.add_argument("-d", "--delete", action="store_true",
+                        help="write a metadata-free copy (<name>_clean.ext) "
+                             "for each image that has metadata")
+    args = parser.parse_args()
+
+    try:
+        for path in gather_paths(args.files):
+            process(path, args.delete)
+    except KeyboardInterrupt:
+        print("\n[scorpion] aborted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
