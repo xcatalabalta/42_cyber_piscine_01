@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-scorpion (library edition) - basic attributes + EXIF/metadata of image files.
+scorpion basic attributes + EXIF/metadata of image files.
 
-This is the "permissive" implementation: it uses Pillow to decode the image
-and read EXIF, rather than parsing the bytes by hand. The subject allows
-libraries that "handle files" as long as the program logic is your own; here
-the reporting logic (what to show, how to organise IFD0 / Exif / GPS) is ours,
-while the low-level byte decoding is delegated to Pillow.
+This implementation uses Pillow to decode the image and read EXIF.
+The low-level byte decoding is delegated to Pillow.
 
 Covers the same extensions as spider (.jpg/.jpeg/.png/.gif/.bmp) and prints:
   - basic attributes: format, mode, dimensions, size, timestamps (incl. creation
@@ -26,20 +23,16 @@ Optional: reverse_geocoder, pycountry  (for the Location line; degrees still
 
 import os
 import sys
+import math
 import signal
 import contextlib
 import datetime
 from PIL import Image, ExifTags, UnidentifiedImageError
+import reverse_geocoder as _rg
+import pycountry as _pycountry
 
-# Reverse geocoding is OPTIONAL: if the packages are missing we still print the
-# decimal coordinates, just not the place name. This keeps the program runnable
-# on a machine that only has Pillow.
-try:
-    import reverse_geocoder as _rg
-    import pycountry as _pycountry
-    _GEOCODE = True
-except ImportError:
-    _GEOCODE = False
+# Reverse geocoding is OPTIONAL: 
+# Use the secure version in case of fail.
 
 # Same set spider handles.
 SUPPORTED = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
@@ -86,6 +79,16 @@ def print_basic(path, img):
         print(f"    Created       : {fmt_time(btime)}")
 
 
+def clean_value(value):
+    """Make a tag value readable: shorten binary blobs, strip NUL padding."""
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, str):
+        # EXIF ASCII fields are often NUL-padded to a fixed width.
+        return value.replace("\x00", "").strip()
+    return value
+
+
 def print_ifd(title, items, names):
     print(f"    [{title}]")
     if not items:
@@ -93,38 +96,48 @@ def print_ifd(title, items, names):
         return
     for tag_id, value in items.items():
         name = names.get(tag_id, f"0x{tag_id:04X}")
-        # Trim long/binary blobs so the output stays readable.
-        text = value
-        if isinstance(value, bytes):
-            text = f"<{len(value)} bytes>"
-        print(f"      {str(name):<22}: {text!r}")
+        print(f"      {str(name):<22}: {clean_value(value)!r}")
+
+
+def clean_ref(ref):
+    """Normalise a GPS ref to an upper-case letter, or '' if absent/padded."""
+    if isinstance(ref, bytes):
+        ref = ref.decode(errors="ignore")
+    return (ref or "").replace("\x00", "").strip().upper()
 
 
 def dms_to_decimal(dms, ref):
     """(degrees, minutes, seconds) + 'N'/'S'/'E'/'W' -> signed decimal degrees."""
     deg, minutes, sec = (float(x) for x in dms)
     dec = deg + minutes / 60 + sec / 3600
-    if isinstance(ref, bytes):
-        ref = ref.decode(errors="ignore")
-    if ref and ref.upper() in ("S", "W"):
+    if clean_ref(ref) in ("S", "W"):
         dec = -dec
     return dec
 
 
 def gps_to_latlon(gps_ifd):
-    """Return (lat, lon) in decimal degrees, or None if GPS data is incomplete."""
-    try:
-        lat = dms_to_decimal(gps_ifd[GPS_LAT], gps_ifd[GPS_LAT_REF])
-        lon = dms_to_decimal(gps_ifd[GPS_LON], gps_ifd[GPS_LON_REF])
-        return lat, lon
-    except (KeyError, TypeError, ValueError):
+    """Return (lat, lon) in decimal degrees, or None if GPS is absent/invalid.
+
+    Phones often write a GPS IFD with no actual fix: empty refs and 0/0
+    rationals that decode to NaN. Those must be rejected, not printed.
+    """
+    rlat = clean_ref(gps_ifd.get(GPS_LAT_REF))
+    rlon = clean_ref(gps_ifd.get(GPS_LON_REF))
+    if rlat not in ("N", "S") or rlon not in ("E", "W"):
         return None
+    try:
+        lat = dms_to_decimal(gps_ifd[GPS_LAT], rlat)
+        lon = dms_to_decimal(gps_ifd[GPS_LON], rlon)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return None
+    return lat, lon
 
 
 def reverse_geocode(lat, lon):
     """Nearest place + country for a coordinate, or None if geocoding is off."""
-    if not _GEOCODE:
-        return None
+
     try:
         # reverse_geocoder prints a "Loading..." banner to stdout on first use;
         # redirect stdout to /dev/null just for that call so our report stays clean.
@@ -149,7 +162,6 @@ def print_gps_location(gps_ifd):
     where = reverse_geocode(lat, lon)
     if where:
         print(f"      {'Location':<22}: {where}")
-
 
 
 def print_exif(img):
@@ -185,6 +197,7 @@ def report(path):
     print(path)
     print("=" * 60)
 
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext not in SUPPORTED:
         print(f"  unsupported extension '{ext}' "
@@ -193,7 +206,7 @@ def report(path):
     if not os.path.isfile(path):
         print("  not a file / cannot read\n")
         return
-
+    """
     try:
         with Image.open(path) as img:
             print_basic(path, img)
@@ -204,14 +217,14 @@ def report(path):
 
 
 def main():
-    # Die quietly on a broken pipe (e.g. `scorpion_lib.py big.jpg | head`)
-    # instead of dumping a BrokenPipeError traceback.
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # Use the secure version in case of fail.
+    
     if len(sys.argv) < 2:
         print("Usage: scorpion_lib.py FILE1 [FILE2 ...]", file=sys.stderr)
         sys.exit(1)
     for path in sys.argv[1:]:
         report(path)
+    print("[scorpion] done.\nDon't forget to delete the .venv folder if you don't need it anymore.")
 
 
 if __name__ == "__main__":
