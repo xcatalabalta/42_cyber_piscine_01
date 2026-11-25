@@ -31,9 +31,6 @@ from PIL import Image, ExifTags, UnidentifiedImageError
 import reverse_geocoder as _rg
 import pycountry as _pycountry
 
-# Same set spider handles.
-SUPPORTED = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
-
 # Reverse lookup tables shipped with Pillow: numeric tag id -> human name.
 TAG_NAMES = ExifTags.TAGS      # IFD0 + Exif tags
 GPS_NAMES = ExifTags.GPSTAGS   # GPS IFD tags
@@ -48,17 +45,6 @@ GPS_LAT = 2
 GPS_LON_REF = 3
 GPS_LON = 4
 
-
-def detect_format(data):
-    if data[:3] == b"\xff\xd8\xff":
-        return "JPEG"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "PNG"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "GIF"
-    if data[:2] == b"BM":
-        return "BMP"
-    return "UNKNOWN"
 
 def human_size(size):
     """
@@ -363,22 +349,14 @@ def strip_metadata(src, dst):
     Returns:
         None (writes the cleaned image to dst)
     """
-    try:
-        with Image.open(src) as img:
-            clean = Image.frombytes(img.mode, img.size, img.tobytes())
-            if img.mode == "P":                 # preserve indexed/GIF palette
-                palette = img.getpalette()
-                if palette:
-                    clean.putpalette(palette)
-            clean.save(dst)
-    except Exception as e:
-        ext = img.format
-        newdst = os.path.splitext(dst)[0] + "." + ext.lower()
-        clean.save(newdst)
-        os.rename(newdst, dst)
-        pass
-
-
+    with Image.open(src) as img:
+        fmt = img.format                                   # true format, by content
+        clean = Image.frombytes(img.mode, img.size, img.tobytes())
+        if img.mode == "P":
+            palette = img.getpalette()
+            if palette:
+                clean.putpalette(palette)
+        clean.save(dst, format=fmt)  
 
 def process(path, delete):
     """
