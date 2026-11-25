@@ -372,7 +372,7 @@ def strip_metadata(src, dst):
                     clean.putpalette(palette)
             clean.save(dst)
     except Exception as e:
-        ext = detect_format(open(src, "rb").read())
+        ext = img.format
         newdst = os.path.splitext(dst)[0] + "." + ext.lower()
         clean.save(newdst)
         os.rename(newdst, dst)

@@ -15,10 +15,11 @@
 
 # output files
 *.out
+spider
 
 # test files and directories
 test/
 test_and_trash
 
-# Virtual environment — rebuilt from requirements.txt, never committed
+# Virtual environment — rebuilt from requirements.txt
 .venv/
