@@ -72,17 +72,56 @@ static int http_download(const char *url, const char *dest)
 - The parent `waitpid`s, then reports success only if curl **exited normally and
   with status 0** — that's the `WIFEXITED(...) && WEXITSTATUS(...) == 0` test.
 
-The curl flags: `-f` fail on HTTP errors (so a 404 returns non-zero instead of
-saving an error page), `-s` silent, `-S` show errors, `-L` follow redirects,
-`-A` set a user-agent, `--max-time 20` give up after 20s.
+### The curl command line
 
-### Why an argv array and not `system()`
+The child builds and execs this command:
 
-Because the arguments are passed as a real array, **no shell parses them**. A URL
-containing `;`, `{`, spaces, or `$(...)` is handed to curl as one opaque
-argument — it can't inject a command. That safety is the whole reason to use
-`fork`+`execvp` instead of `system("curl " + url)`, which would let a malicious
-link run shell commands.
+```
+curl -fsSL -A arachnida-spider/1.0 --max-time 20 -o <dest> <url>
+```
+
+**The array mechanics.** `argv[0]` is `"curl"` (the program's own name); every
+later element is one argument *token*; the terminating `NULL` is required so
+`execvp` knows where the list ends. In `execvp`, the `v` means "arguments as a
+**v**ector (array)" and the `p` means "search `PATH` for the `curl` binary" (so
+the path isn't hard-coded). The `(char *)` casts on `dest`/`url` only drop
+`const` to satisfy `execvp`'s `char * const argv[]` type — curl never modifies
+them.
+
+**No shell = no injection.** Because the arguments go to `execvp` as a real
+array, **no shell parses them**. A URL containing `;`, `{`, spaces, or `$(...)`
+is handed to curl as one opaque argument and can't inject a command. That safety
+is the whole reason to use `fork`+`execvp` instead of `system("curl " + url)`,
+which would let a malicious link run shell commands.
+
+**The flags:**
+
+| Option | Meaning | Why it's here |
+|--------|---------|---------------|
+| `-f` (`--fail`) | fail (non-zero exit, no body) on HTTP 4xx/5xx | a 404's error page isn't saved as if it were the image |
+| `-s` (`--silent`) | no progress meter or chatter | keep output clean |
+| `-S` (`--show-error`) | with `-s`, still print real errors | stay quiet without hiding failures |
+| `-L` (`--location`) | follow 3xx redirects | http→https / CDN redirects resolve instead of returning an empty body |
+| `-A UA` (`--user-agent`) | send `UA` as the `User-Agent` header | see below |
+| `--max-time 20` | 20 s cap on the whole transfer | a slow/hung server can't stall the crawl |
+| `-o <dest>` (`--output`) | write the body to the file `dest` | **this is the "save the image" step** — no pipe needed |
+
+Note there is **no `--max-filesize`** here: images are expected to be large, so
+the download isn't size-capped (only time-capped). That size cap lives in
+`http_get` instead, where the body is a page to be parsed.
+
+**Why a User-Agent at all.** `User-Agent` is an HTTP request header that
+identifies the client. If you send none, curl sends its default `curl/8.x.x`,
+which many servers treat as a bot — returning `403`, a CAPTCHA, or stripped-down
+content — so you'd fetch an error page instead of the real bytes. Sending any
+plausible UA avoids the laziest of those filters. The value is almost arbitrary
+(the server just reads a string), so it's really a choice between an **honest
+identifier** — `"arachnida-spider/1.0"` openly says "I am a crawler," transparent
+and polite — and **browser impersonation** (`Mozilla/5.0 …`) to slip past bot
+blocks, which is deceptive and can breach a site's terms. The honest identifier
+is the right default for a school crawler; you can add contact info
+(`"arachnida-spider/1.0 (+https://github.com/fcatala-/arachnida)"`) to be an even
+better citizen.
 
 ---
 
@@ -173,6 +212,62 @@ static char *http_get(const char *url)
     return buf;
 }
 ```
+
+### The curl command line
+
+The child builds and execs this command:
+
+```
+curl -fsSL -A arachnida-spider/1.0 --max-time 20 --max-filesize 5000000 <url>
+```
+
+**The array mechanics.** `argv[0]` is `"curl"` (the program's own name); every
+later element is one argument *token*; the terminating `NULL` is required so
+`execvp` knows where the list ends. In `execvp`, the `v` means "arguments as a
+**v**ector (array)" and the `p` means "search `PATH` for the `curl` binary." The
+`(char *)` cast on `url` only drops `const` to satisfy `execvp`'s
+`char * const argv[]` type — curl never modifies it.
+
+**No shell = no injection.** Because the arguments go to `execvp` as a real
+array, **no shell parses them**. A URL containing `;`, `{`, spaces, or `$(...)`
+is handed to curl as one opaque argument and can't inject a command. That is why
+the fetch uses `fork`+`execvp`, never `system("curl " + url)`, which would let a
+malicious link run shell commands.
+
+**The flags:**
+
+| Option | Meaning | Why it's here |
+|--------|---------|---------------|
+| `-f` (`--fail`) | fail (non-zero exit, no body) on HTTP 4xx/5xx | a 404's error page isn't parsed as if it were a real page |
+| `-s` (`--silent`) | no progress meter or chatter | keep the piped bytes clean — only the body |
+| `-S` (`--show-error`) | with `-s`, still print real errors | stay quiet without hiding failures |
+| `-L` (`--location`) | follow 3xx redirects | http→https / CDN redirects resolve instead of returning an empty body |
+| `-A UA` (`--user-agent`) | send `UA` as the `User-Agent` header | see below |
+| `--max-time 20` | 20 s cap on the whole transfer | a slow/hung server can't stall the crawl |
+| `--max-filesize 5000000` | abort if the body exceeds ~5 MB | the body is about to be parsed as a page — don't pull a giant blob into memory |
+
+**The two differences from `http_download`:**
+
+- **No `-o`.** curl writes the body to **stdout**, which `dup2` has redirected
+  into the pipe, so the parent reads it back — that is the entire purpose of this
+  function (a page must come *into* the program to be scanned).
+- **`--max-filesize 5000000` is present.** A page is meant to be parsed, so an
+  accidental huge binary should be refused rather than buffered into memory. One
+  caveat: `--max-filesize` relies on the server sending a `Content-Length`
+  header; without one, the cap can't be enforced before the download starts.
+
+**Why a User-Agent at all.** `User-Agent` is an HTTP request header that
+identifies the client. If you send none, curl sends its default `curl/8.x.x`,
+which many servers treat as a bot — returning `403`, a CAPTCHA, or stripped-down
+content — so you'd fetch an error page instead of the real HTML. Sending any
+plausible UA avoids the laziest of those filters. The value is almost arbitrary
+(the server just reads a string), so it's really a choice between an **honest
+identifier** — `"arachnida-spider/1.0"` openly says "I am a crawler," transparent
+and polite — and **browser impersonation** (`Mozilla/5.0 …`) to slip past bot
+blocks, which is deceptive and can breach a site's terms. The honest identifier
+is the right default for a school crawler; you can add contact info
+(`"arachnida-spider/1.0 (+https://github.com/fcatala-/arachnida)"`) to be an even
+better citizen.
 
 ### The `dup2` redirect
 
